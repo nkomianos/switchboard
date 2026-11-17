@@ -15,6 +15,7 @@ All notable changes to Switchboard. The format follows [Keep a Changelog](https:
 - SECURITY.md, CONTRIBUTING.md, issue templates, and a comparison with other approaches in the README.
 
 ### Changed
+- A Claude Code or Codex turn that finishes within 90 seconds of your prompt no longer pings you right away, because you're probably still looking at it. The ping waits 2 minutes and never comes if you reply in that session first. A finished turn that waited for a break or your digest is dropped the same way once you've replied there. Turns you start from Switchboard's Reply still ping. Set `watching` in `config.json` to change the timings, or to `null` to turn it off.
 - Claude Code permission prompts wait **60 seconds** for you by default (was 10 minutes), then Claude shows its own prompt. Change it in Settings → Delivery. The hook timeout written to Claude's settings is now only a ceiling, so changing the wait never needs a reconnect.
 - Running from npx's temporary folder, Switchboard won't connect agents or set up autostart (they'd break when npm clears its cache) and tells you how to install it instead.
 

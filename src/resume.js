@@ -41,11 +41,14 @@ export function resumeSession(reply, text, { spawnImpl = spawn, settleMs = 2500,
       // On Windows the CLIs are .cmd shims, so they need a shell. Arguments are fixed and
       // the session id is validated above; your message only travels over stdin.
       // (Passing one command string rather than an args array keeps Node from warning.)
+      // SWITCHBOARD_REPLY tells our hooks this turn came from Switchboard, so its answer
+      // pings you as usual instead of assuming you're watching the terminal.
       const win = process.platform === 'win32';
       const args = r.args(reply.session);
+      const env = { ...process.env, SWITCHBOARD_REPLY: '1' };
       child = win
-        ? spawnImpl([r.cmd, ...args].join(' '), [], { cwd, shell: true, windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] })
-        : spawnImpl(r.cmd, args, { cwd, windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
+        ? spawnImpl([r.cmd, ...args].join(' '), [], { cwd, env, shell: true, windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] })
+        : spawnImpl(r.cmd, args, { cwd, env, windowsHide: true, stdio: ['pipe', 'ignore', 'pipe'] });
     } catch (err) {
       return done({ ok: false, error: err.message });
     }

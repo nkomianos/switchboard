@@ -18,7 +18,7 @@ import { AgentKeys } from './keys.js';
 import { buildMcpServer } from './mcp-server.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createServer } from './server.js';
-import { agentSessions } from './sessions.js';
+import { agentSessions, lastPromptAt } from './sessions.js';
 import { answerView, findOption } from './spec.js';
 import { HumanState, MODES, fetchIcs } from './state.js';
 import { Telegram } from './telegram.js';
@@ -40,7 +40,7 @@ function outcomeLine(a) {
     case 'defaulted': return `⏱ No answer in time, “${label}” applied`;
     case 'dismissed': return `✖ Dismissed${label ? `, “${label}” applied` : ''}`;
     case 'expired': return '⏱ Expired';
-    case 'cancelled': return '↩ Withdrawn by the agent';
+    case 'cancelled': return a.answer?.surface === 'session' ? '↩ You replied in the session' : '↩ Withdrawn by the agent';
     default: return null;
   }
 }
@@ -62,7 +62,9 @@ export async function startDaemon({ home, port, overrides = {}, log = (m) => con
   const budgets = new Budgets(config.budget, clock);
   const state = new HumanState(config, clock);
   const rules = new Rules(readJSON(p.rules, []), clock);
-  const router = new Router({ config, clock, ledger, budgets, state, rules });
+  // Did you reply in that agent session yourself (its log has a newer prompt from you)?
+  const repliedSince = (reply, since) => (lastPromptAt(reply.transcript) ?? 0) > since;
+  const router = new Router({ config, clock, ledger, budgets, state, rules, repliedSince });
 
   const saved = readJSON(p.state, null);
   if (saved) {

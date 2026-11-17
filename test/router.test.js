@@ -73,6 +73,106 @@ describe('routing', () => {
   });
 });
 
+describe('conversations you are in', () => {
+  // A finished Claude Code / Codex turn, as the hooks send it.
+  const turn = (over = {}, reply = {}) => ({
+    agent: { id: 'claude-code-api', name: 'Claude Code · api' },
+    question: 'Finished in api: Done, tests pass.',
+    collapse_key: 'claude-code-turn:s1',
+    metadata: { reply: { via: 'claude-code', session: 's1', cwd: '/x/api', transcript: '/x/s1.jsonl', ...reply } },
+    ...over,
+  });
+  const ask = (over, reply) => turn({ question: 'api: Want me to open a PR?', input: { type: 'text' }, ...over }, reply);
+  const watched = () => ({ prompted_at: t - 20e3 });
+  const tickFor = (ms, r) => { for (let i = 0; i < ms / 1000; i++) advance(1000, r); };
+
+  test('a turn you prompted moments ago waits, and never pings if you reply in the session', () => {
+    let replied = false;
+    const { r, pings } = makeRouter();
+    r.repliedSince = (reply, since) => { assert.equal(reply.transcript, '/x/s1.jsonl'); return replied && since > 0; };
+    const q = r.submit(ask({}, watched()));
+    assert.equal(q.delivery.mode, 'held');
+    assert.match(q.delivery.reason, /probably watching; pings in 2m unless you reply there first/);
+    tickFor(60e3, r);
+    replied = true; // you answered in the terminal
+    tickFor(90e3, r);
+    assert.equal(pings.length, 0);
+    assert.equal(q.status, 'cancelled');
+    assert.deepEqual([q.answer.by, q.answer.surface], ['human', 'session']);
+    assert.equal(r.budgets.get(q.agent).tokens, 6, 'costs the agent nothing');
+  });
+
+  test('if you walk away instead, it pings once the hold is over', () => {
+    const { r, pings } = makeRouter();
+    r.repliedSince = () => false;
+    const u = r.submit(turn({}, watched()));
+    tickFor(119e3, r);
+    assert.equal(pings.length, 0);
+    tickFor(3e3, r);
+    assert.equal(pings.length, 1);
+    assert.equal(u.delivery.mode, 'interrupted');
+  });
+
+  test('if the hold ends while you are focused, it routes like any other turn', () => {
+    const { r, pings } = makeRouter();
+    r.repliedSince = () => false;
+    const u = r.submit(turn({}, watched()));
+    const q = r.submit(ask({ agent: { id: 'codex-web', name: 'Codex · web' }, collapse_key: 'codex-turn:t1' }, watched()));
+    r.setState('focus');
+    tickFor(125e3, r);
+    assert.equal(pings.length, 0);
+    assert.equal(u.delivery.mode, 'digest');
+    assert.equal(q.delivery.mode, 'held');
+    assert.match(q.delivery.reason, /focus/);
+    assert.equal(u.watched_until, undefined);
+  });
+
+  test('a long turn, or one you started from Switchboard, pings right away', () => {
+    const { r } = makeRouter();
+    r.repliedSince = () => false;
+    assert.equal(r.submit(turn({}, { prompted_at: t - 10 * 60e3 })).delivery.mode, 'queued', 'you likely stepped away during a 10 minute turn');
+    assert.equal(r.submit(turn({ collapse_key: 'claude-code-turn:s2' })).delivery.mode, 'queued', 'no prompted_at: the prompt came from your inbox or phone');
+  });
+
+  test('a newer turn from the same session replaces the one that was waiting', () => {
+    const { r, pings } = makeRouter();
+    const first = r.submit(ask({}, watched()));
+    advance(30e3, r);
+    const second = r.submit(turn({}, { prompted_at: t - 10e3 }));
+    assert.equal(first.status, 'cancelled');
+    assert.equal(second.delivery.mode, 'held');
+    assert.equal(pings.length, 0);
+  });
+
+  test('held during focus: if you already replied in the session, the break brings no stale ping', () => {
+    let replied = false;
+    const { r, pings } = makeRouter();
+    r.repliedSince = () => replied;
+    r.setState('focus');
+    const q = r.submit(ask());
+    const u = r.submit(turn({ agent: { id: 'codex-web', name: 'Codex · web' }, collapse_key: 'codex-turn:t1' }, { via: 'codex', session: 't1' }));
+    assert.equal(q.delivery.mode, 'held');
+    assert.equal(u.delivery.mode, 'digest');
+    advance(60e3, r);
+    replied = true;
+    r.setState('available');
+    assert.equal(pings.length, 0, 'nothing left to tell you');
+    assert.equal(q.status, 'cancelled');
+    assert.equal(u.status, 'read');
+  });
+
+  test('without a session check, or for other agents, nothing changes', () => {
+    const { r } = makeRouter();
+    assert.equal(r.submit(turn({}, { prompted_at: t - 20e3, transcript: undefined })).delivery.mode, 'held', 'still waits while you watch');
+    r.setState('focus');
+    const plain = r.submit(decision());
+    r.setState('available');
+    assert.equal(plain.delivery.mode, 'interrupted', 'an ordinary ask pings at the break as before');
+    const off = makeRouter({ watching: null }).r;
+    assert.equal(off.submit(turn({}, watched())).delivery.mode, 'queued', 'watching: null turns it off');
+  });
+});
+
 describe('snooze', () => {
   test('a snoozed ask comes back and pings you when the snooze ends, without spending budget', () => {
     const { r, pings } = makeRouter({ budget: { initial: 1, min: 1, max: 30 } });

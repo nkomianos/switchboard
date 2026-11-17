@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
@@ -7,6 +7,7 @@ import { expandEvents, parseIcs } from '../src/ics.js';
 import { Ledger } from '../src/ledger.js';
 import { elicitationToAsk, answerToElicitResult } from '../src/proxy.js';
 import { claudeInform, codexInform, permissionAsk, permissionOutput } from '../src/hooks.js';
+import { codexTranscript, lastPromptAt } from '../src/sessions.js';
 import { normalizeAsk, SpecError } from '../src/spec.js';
 import { HumanState } from '../src/state.js';
 import { matchGlob, parseDuration } from '../src/util.js';
@@ -182,5 +183,40 @@ describe('Claude Code hook mapping', () => {
     assert.equal(c.kind, 'input');
     assert.deepEqual(c.metadata.reply, { via: 'codex', session: 't-1', cwd: '/x/web' });
     assert.equal(claudeInform({ hook_event_name: 'Stop', session_id: 's2', last_assistant_message: 'Done. Let me know if you want changes.' }).kind, 'inform');
+  });
+
+  test('a finished turn knows when you last prompted that session, from its log', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sb-log-'));
+    const jsonl = (rows) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
+    const claudeLog = join(dir, 's1.jsonl');
+    writeFileSync(claudeLog, jsonl([
+      { type: 'user', timestamp: '2026-11-17T10:00:00.000Z', message: { role: 'user', content: 'older prompt' } },
+      { type: 'user', timestamp: '2026-11-17T10:05:00.000Z', message: { role: 'user', content: [{ type: 'text', text: 'Fix the flaky test' }] } },
+      { type: 'assistant', timestamp: '2026-11-17T10:05:10.000Z', message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Bash' }] } },
+      { type: 'user', timestamp: '2026-11-17T10:05:20.000Z', toolUseResult: {}, message: { role: 'user', content: [{ type: 'tool_result', content: 'ok' }] } },
+      { type: 'user', timestamp: '2026-11-17T10:05:30.000Z', isMeta: true, message: { role: 'user', content: 'injected context' } },
+      { type: 'user', timestamp: '2026-11-17T10:05:40.000Z', message: { role: 'user', content: '<task-notification>build finished</task-notification>' } },
+      { type: 'assistant', timestamp: '2026-11-17T10:05:50.000Z', message: { role: 'assistant', content: [{ type: 'text', text: 'Fixed. Want me to open a PR?' }] } },
+    ]));
+    assert.equal(lastPromptAt(claudeLog), Date.parse('2026-11-17T10:05:00.000Z'), 'tool results, injected context and notices are not you');
+    const stop = { hook_event_name: 'Stop', cwd: '/x/api', session_id: 's1', transcript_path: claudeLog, last_assistant_message: 'Fixed. Want me to open a PR?' };
+    assert.deepEqual(claudeInform(stop, { env: {} }).metadata.reply, { via: 'claude-code', session: 's1', cwd: '/x/api', transcript: claudeLog, prompted_at: Date.parse('2026-11-17T10:05:00.000Z') });
+    assert.equal(claudeInform(stop, { env: { SWITCHBOARD_REPLY: '1' } }).metadata.reply.prompted_at, undefined, 'a turn you started from Switchboard');
+    assert.equal(lastPromptAt(join(dir, 'missing.jsonl')), null);
+
+    const home = join(dir, 'home');
+    const day = join(home, '.codex', 'sessions', '2026', '11', '17');
+    mkdirSync(day, { recursive: true });
+    const codexLog = join(day, 'rollout-2026-11-17T10-00-00-019f0000-aaaa-bbbb.jsonl');
+    writeFileSync(codexLog, jsonl([
+      { timestamp: '2026-11-17T10:00:00.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<environment_context>cwd</environment_context>' }] } },
+      { timestamp: '2026-11-17T10:00:01.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Write the plan' }] } },
+      { timestamp: '2026-11-17T10:01:00.000Z', type: 'event_msg', payload: { type: 'task_complete' } },
+    ]));
+    assert.equal(codexTranscript('019f0000-aaaa-bbbb', { home }), codexLog);
+    assert.equal(codexTranscript('../../etc', { home }), null);
+    const c = codexInform({ type: 'agent-turn-complete', 'thread-id': '019f0000-aaaa-bbbb', cwd: '/x/web', 'last-assistant-message': 'Plan is in docs/plan.md.' }, { env: {}, home });
+    assert.equal(c.metadata.reply.transcript, codexLog);
+    assert.equal(c.metadata.reply.prompted_at, Date.parse('2026-11-17T10:00:01.000Z'));
   });
 });

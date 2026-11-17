@@ -154,6 +154,50 @@ export function codexSessions({ home = homedir(), now = Date.now() } = {}) {
   });
 }
 
+/**
+ * Something you typed into the session yourself. Tool results, injected context,
+ * compaction summaries and notices like `<task-notification>` don't count.
+ */
+function isPrompt(e) {
+  if (e.type === 'user') {
+    if (e.isMeta || e.isSidechain || e.isCompactSummary || e.toolUseResult) return false;
+    const c = e.message?.content;
+    if (Array.isArray(c) && c.some((x) => x.type === 'tool_result')) return false;
+    const t = textOf(c).trim();
+    return !!t && !t.startsWith('<');
+  }
+  const p = e.payload || {};
+  if (e.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+    const t = textOf(p.content).trim();
+    return !!t && !t.startsWith('<');
+  }
+  if (e.type === 'event_msg' && p.type === 'user_message') {
+    const t = String(p.message || '').trim();
+    return !!t && !t.startsWith('<');
+  }
+  return false;
+}
+
+/** When you last wrote to this Claude Code or Codex session (ms), from its log. null if unknown. */
+export function lastPromptAt(file) {
+  if (!file) return null;
+  let entries;
+  try { entries = tailLines(file, 128 * 1024); } catch { return null; }
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (!isPrompt(entries[i])) continue;
+    const ms = Date.parse(entries[i].timestamp);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+/** A Codex thread's log file, found by its id among recent sessions. */
+export function codexTranscript(threadId, { home = homedir(), now = Date.now() } = {}) {
+  if (!/^[\w-]{6,200}$/.test(String(threadId || ''))) return null;
+  const files = recentFiles(join(home, '.codex', 'sessions'), 3, now, new RegExp(`${threadId}\\.jsonl$`));
+  return files.sort((a, b) => b.mtime - a.mtime)[0]?.file ?? null;
+}
+
 export function agentSessions(opts = {}) {
   const out = [];
   for (const fn of [claudeSessions, codexSessions]) {

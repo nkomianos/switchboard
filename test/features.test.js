@@ -348,8 +348,9 @@ describe('reviews, notes and replies', () => {
   test('resuming a session: message on stdin, a clear error when the CLI is missing', async () => {
     const { EventEmitter } = await import('node:events');
     const { resumeSession, manualCommand } = await import('../src/resume.js');
-    const fake = (behaviour) => (cmd, args) => {
+    const fake = (behaviour) => (cmd, args, opts) => {
       const child = new EventEmitter();
+      child.opts = opts;
       child.stdin = { written: '', on() {}, end(t) { this.written = t; } };
       child.stderr = new EventEmitter();
       child.args = [cmd, ...args];
@@ -364,6 +365,7 @@ describe('reviews, notes and replies', () => {
     assert.equal(ok.ok, true);
     assert.deepEqual(fake.last.args.join(' ').split(' '), ['codex','exec', 'resume', '--skip-git-repo-check', 'abc-123', '-']);
     assert.equal(fake.last.stdin.written, 'Yes, open the PR');
+    assert.equal(fake.last.opts.env.SWITCHBOARD_REPLY, '1', 'the hooks can tell this turn came from Switchboard');
     const bad = await resumeSession({ via: 'codex', session: 'abc-123' }, 'hi', { spawnImpl: fake('missing'), settleMs: 200 });
     assert.equal(bad.ok, false);
     assert.match(bad.error, /Codex CLI not found/);

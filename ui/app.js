@@ -750,8 +750,8 @@ function outcome(a) {
     case 'defaulted': return { icon: 'clock', cls: 'def', text: `No answer in time. Default “${val}” applied` };
     case 'dismissed': return { icon: 'x', cls: 'bad', text: `Dismissed${val ? `. Agent got “${val}”` : ''}` };
     case 'expired': return { icon: 'alert', cls: 'bad', text: 'Expired with no answer' };
-    case 'cancelled': return { icon: 'x', cls: '', text: 'Withdrawn by the agent' };
-    case 'read': return { icon: 'check', cls: '', text: ans.by === 'collapsed' ? 'Replaced by a newer update' : ans.by === 'rule' || String(ans.by).startsWith('rule') ? 'Muted by your rule' : 'Read' };
+    case 'cancelled': return { icon: 'x', cls: '', text: ans.surface === 'session' ? 'You replied in the session itself' : 'Withdrawn by the agent' };
+    case 'read': return { icon: 'check', cls: '', text: ans.by === 'collapsed' ? 'Replaced by a newer update' : ans.by === 'rule' || String(ans.by).startsWith('rule') ? 'Muted by your rule' : ans.surface === 'session' ? 'You replied in the session itself' : 'Read' };
     default: return { icon: 'info', cls: '', text: a.status };
   }
 }
