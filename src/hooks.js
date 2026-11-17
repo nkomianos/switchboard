@@ -1,5 +1,6 @@
 // Intake from coding agents that don't speak Switchboard: Claude Code hooks and Codex notify.
 import { basename } from 'node:path';
+import { codexTranscript, lastPromptAt } from './sessions.js';
 import { slug, truncate } from './util.js';
 
 const RISKY = /\b(rm|rmdir|del|drop|truncate|shred|mkfs|dd|push|deploy|publish|release|chmod|chown|kill)\b|reset\s+--hard|--force|curl[^|]*\|\s*(ba)?sh/i;
@@ -23,13 +24,25 @@ export function lastQuestion(text) {
 }
 
 /**
+ * Where a finished turn's session log is, and when you last prompted it. The router
+ * uses them to leave you alone while you're still looking at that session. A turn you
+ * started from Switchboard's Reply has no prompted_at: you're on the inbox or phone.
+ */
+function sessionLog(transcript, env) {
+  if (!transcript) return {};
+  if (env.SWITCHBOARD_REPLY === '1') return { transcript };
+  const at = lastPromptAt(transcript);
+  return at ? { transcript, prompted_at: at } : { transcript };
+}
+
+/**
  * A finished turn becomes something you can reply to: a question (pings you, like a
  * decision) if the agent ended by asking something, otherwise an update. Either way
  * metadata.reply says how to resume that exact session with your answer.
  */
-function finishedTurn({ agent, project, message, via, session, cwd, name }) {
+function finishedTurn({ agent, project, message, via, session, cwd, name, log = {} }) {
   const msg = String(message || 'turn complete');
-  const reply = session ? { via, session, cwd: cwd || null } : null;
+  const reply = session ? { via, session, cwd: cwd || null, ...log } : null;
   const base = {
     agent,
     detail: { full: message || null },
@@ -115,12 +128,13 @@ export function permissionOutput(view) {
 }
 
 /** Notification / Stop payloads become FYIs. Returns null when there's nothing worth sending. */
-export function claudeInform(p) {
+export function claudeInform(p, { env = process.env } = {}) {
   const agent = claudeAgent(p);
   const project = p.cwd ? basename(p.cwd) : 'session';
   if (p.hook_event_name === 'Stop') {
     if (p.stop_hook_active) return null;
-    return finishedTurn({ agent, project, message: p.last_assistant_message, via: 'claude-code', session: p.session_id, cwd: p.cwd, name: 'Claude' });
+    const log = sessionLog(p.transcript_path, env);
+    return finishedTurn({ agent, project, message: p.last_assistant_message, via: 'claude-code', session: p.session_id, cwd: p.cwd, name: 'Claude', log });
   }
   if (p.hook_event_name === 'Notification') {
     // Permission prompts arrive through PermissionRequest; idle prompts duplicate Stop.
@@ -157,10 +171,11 @@ export async function runClaudeHook(payload, { client, waitSeconds = 600, signal
 }
 
 /** Codex `notify` program: receives one JSON argument per completed turn. */
-export function codexInform(p) {
+export function codexInform(p, { env = process.env, home } = {}) {
   if (p?.type !== 'agent-turn-complete') return null;
   const project = p.cwd ? basename(p.cwd) : 'codex';
   const session = p['thread-id'] || null;
+  const log = session ? sessionLog(codexTranscript(session, home ? { home } : {}), env) : {};
   return finishedTurn({
     agent: { id: `codex-${slug(project)}`, name: `Codex · ${project}`, instance: session },
     project,
@@ -169,5 +184,6 @@ export function codexInform(p) {
     session,
     cwd: p.cwd,
     name: 'Codex',
+    log,
   });
 }

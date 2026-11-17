@@ -150,6 +150,7 @@ flowchart LR
 | **Deadlines & safe defaults** | A request with a safe default can wait: the default applies at the deadline. A request with *no* safe default escalates shortly before its deadline. |
 | **Snooze** | Snooze a request for 5 minutes or until tomorrow. When it comes back it pings you, even if the agent is out of budget. |
 | **Collapse keys** | A newer “build finished” replaces the unread older one, like mobile push. |
+| **Conversations you're in** | When Claude Code or Codex finishes a turn within 90 seconds of your prompt, you're probably still watching it. The ping waits 2 minutes and never comes if you reply in that session first. A finished turn that waited for a break or your digest is dropped the same way once you've replied there. Turns you started from Switchboard ping as usual. |
 
 ## Connect your agents
 
@@ -181,7 +182,7 @@ switchboard setup claude-code           # print the config to add by hand instea
 <summary><b>Claude Code</b>: permission prompts become one-tap decisions</summary>
 
 - **PermissionRequest**: Allow/Deny goes to your inbox and phone, and your answer goes back to Claude Code. If you don't answer within 60 seconds (change it in Settings), Claude Code shows its normal prompt, so it never looks frozen.
-- **Stop**: “Finished in api: …” updates, one per session.
+- **Stop**: “Finished in api: …” updates, one per session. A turn you're watching doesn't ping you (see [How it decides](#how-it-decides)).
 - **Notification**: other “needs you” moments.
 - Optional: `claude mcp add switchboard -- node /path/to/bin/switchboard.js mcp` gives Claude an `ask_human` tool for questions mid-task.
 

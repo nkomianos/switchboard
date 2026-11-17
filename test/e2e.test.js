@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer, request } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,6 +135,35 @@ describe('Claude Code hook', () => {
     assert.equal(await new Promise((r) => child.on('exit', r)), 0);
     const a = await nextOpenAsk((x) => x.kind === 'inform' && x.question.includes('Refactor complete'));
     assert.equal(a.agent.id, 'claude-code-web');
+  });
+
+  test('a turn you are watching does not ping, and your reply in the terminal settles it', async () => {
+    const log = join(mkdtempSync(join(tmpdir(), 'switchboard-log-')), 'sess-3.jsonl');
+    const prompt = (text) => `${JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: text } })}\n`;
+    writeFileSync(log, prompt('Rename the config flag'));
+    const saved = d.router.config.watching;
+    d.router.config.watching = { turnMs: 90e3, holdMs: 600 };
+    const pinged = [];
+    const onPing = (n) => pinged.push(...n.asks.map((x) => x.id));
+    d.router.on('interrupt', onPing);
+    try {
+      const child = spawn(process.execPath, [BIN, 'hook', 'claude-code'], { env });
+      child.stdin.end(JSON.stringify({ hook_event_name: 'Stop', session_id: 'sess-3', cwd: '/work/cli', transcript_path: log, last_assistant_message: 'Renamed. Want me to update the docs too?' }));
+      assert.equal(await new Promise((r) => child.on('exit', r)), 0);
+      const a = await nextOpenAsk((x) => x.metadata?.reply?.session === 'sess-3');
+      assert.equal(a.delivery.mode, 'held');
+      assert.match(a.delivery.reason, /probably watching/);
+      await sleep(30);
+      appendFileSync(log, prompt('Yes, update the docs too'));
+      await sleep(1200);
+      const after = await c.request('GET', `/v1/asks/${a.id}`);
+      assert.equal(after.status, 'cancelled');
+      assert.equal(after.ask.answer.surface, 'session');
+      assert.ok(!pinged.includes(a.id), 'never pinged');
+    } finally {
+      d.router.off('interrupt', onPing);
+      d.router.config.watching = saved;
+    }
   });
 });
 

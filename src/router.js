@@ -20,6 +20,9 @@ export const DEFAULT_ROUTER_CONFIG = {
   digest: { times: ['12:00', '17:30'], onBreak: true },
   quietHours: null,
   calendar: null,
+  // A Claude Code or Codex turn that finishes within turnMs of your prompt is one you're
+  // probably still looking at: its ping waits holdMs, and never comes if you reply there.
+  watching: { turnMs: 90e3, holdMs: 120e3 },
 };
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
@@ -41,10 +44,15 @@ function summarize(ask) {
 }
 
 export class Router extends EventEmitter {
-  constructor({ config = {}, clock = Date.now, ledger, budgets, state, rules } = {}) {
+  /**
+   * repliedSince(reply, ms): have you written to that agent session yourself since ms?
+   * The daemon reads the session log; without it, finished turns route as before.
+   */
+  constructor({ config = {}, clock = Date.now, ledger, budgets, state, rules, repliedSince = null } = {}) {
     super();
     this.config = { ...DEFAULT_ROUTER_CONFIG, ...config };
     this.clock = clock;
+    this.repliedSince = repliedSince;
     this.ledger = ledger ?? new Ledger();
     this.budgets = budgets ?? new Budgets(this.config.budget, clock);
     this.state = state ?? new HumanState(this.config, clock);
@@ -84,6 +92,11 @@ export class Router extends EventEmitter {
         }
       }
     }
+
+    // You prompted this session moments ago, so you're probably watching it answer.
+    const prompted = Number(ask.metadata?.reply?.prompted_at);
+    const w = this.config.watching;
+    if (w && prompted > 0 && now - prompted >= 0 && now - prompted <= w.turnMs) ask.watched_until = now + w.holdMs;
 
     const rule = this.rules.match(ask);
     if (rule) {
@@ -139,6 +152,9 @@ export class Router extends EventEmitter {
     if (forced === 'digest') return { mode: 'digest', reason: 'your rule sends this to the digest', notes };
     if (forced === 'hold' || forced === 'mute') return { mode: 'held', reason: 'your rule says never interrupt for this', notes };
     if (rec.muted) return { mode: 'held', reason: `you muted ${rec.name}`, notes };
+    if (ask.watched_until > now) {
+      return { mode: 'held', reason: `you prompted it a moment ago and are probably watching; pings in ${fmtDuration(ask.watched_until - now)} unless you reply there first`, notes };
+    }
 
     if (ask.woke) {
       // A reminder you set yourself doesn't spend the agent's budget, but it still respects focus.
@@ -199,8 +215,23 @@ export class Router extends EventEmitter {
     return n;
   }
 
+  /**
+   * Before a waiting finished turn pings you: if you already replied in that session
+   * yourself, it's settled there and the card closes quietly. Unknown means ping.
+   */
+  _repliedInSession(ask) {
+    const reply = ask.metadata?.reply;
+    if (!this.repliedSince || !reply?.transcript) return false;
+    let replied = false;
+    try { replied = !!this.repliedSince(reply, ask.created_at); } catch { return false; }
+    if (!replied) return false;
+    const answer = { by: 'human', surface: 'session', reason: 'you replied in the session itself' };
+    this._finalize(ask, ask.kind === 'inform' ? 'read' : 'cancelled', answer);
+    return true;
+  }
+
   _collectDigest(now) {
-    const items = [...this.asks.values()].filter((a) => isOpen(a) && a.delivery?.mode === 'digest' && !a.delivery.digested_at);
+    const items = [...this.asks.values()].filter((a) => isOpen(a) && a.delivery?.mode === 'digest' && !a.delivery.digested_at && !this._repliedInSession(a));
     for (const a of items) a.delivery.digested_at = now;
     if (items.length) this.stats.digests++;
     return items;
@@ -256,7 +287,13 @@ export class Router extends EventEmitter {
       const mode = ask.delivery?.mode;
       if (mode === 'held' || (mode === 'digest' && ask.kind !== 'inform')) {
         const d = this._decide(ask, now);
-        if (d.mode === 'interrupt') this._applyRoute(ask, d, now);
+        const watchOver = ask.watched_until != null && ask.watched_until <= now;
+        if (watchOver) delete ask.watched_until;
+        if (d.mode === 'interrupt') {
+          if (!this._repliedInSession(ask)) this._applyRoute(ask, d, now);
+        } else if (watchOver) {
+          this._applyRoute(ask, d, now); // the hold is over: from here it routes like anything else
+        }
       }
     }
 

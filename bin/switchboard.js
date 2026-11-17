@@ -324,7 +324,7 @@ async function cmdHook(args) {
       } catch { /* the original notifier is best-effort, like ours */ }
     }
     try {
-      const inform = codexInform(JSON.parse(raw));
+      const inform = codexInform(JSON.parse(raw), agentHomeOpts());
       if (inform) await c.submit(inform);
     } catch (err) { console.error(`switchboard hook codex: ${err.message}`); }
     return;
