@@ -113,6 +113,15 @@ export class SwitchboardClient {
     return this.submit({ kind: 'inform', question: message, ...opts });
   }
 
+  /**
+   * Report a piece of work's state: 'running' or 'queued' (its updates wait quietly; send it
+   * again as a heartbeat), or 'done', 'failed', 'cancelled' (its newest message may ping you).
+   */
+  async work(id, status, { pass } = {}) {
+    await this.ensure();
+    return this.request('POST', `/v1/work/${encodeURIComponent(id)}`, { status, pass });
+  }
+
   async state() {
     await this.ensure();
     return this.request('GET', '/v1/state');

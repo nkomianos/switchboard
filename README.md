@@ -150,6 +150,7 @@ flowchart LR
 | **Deadlines & safe defaults** | A request with a safe default can wait: the default applies at the deadline. A request with *no* safe default escalates shortly before its deadline. |
 | **Snooze** | Snooze a request for 5 minutes or until tomorrow. When it comes back it pings you, even if the agent is out of budget. |
 | **Collapse keys** | A newer “build finished” replaces the unread older one, like mobile push. |
+| **Final outcome only** | A request worked on in several passes (a draft, an automatic fix, a follow-up) pings you once, for its outcome. Earlier passes wait quietly in the inbox, the check runs again right before anything goes out, and a “no report arrived” note stays quiet when the report did arrive. Agents opt in with a [`work` id](spec/ask-v0.1.md#work-in-passes). |
 
 ## Connect your agents
 
@@ -343,6 +344,7 @@ switchboard setup [agent] [--write|--remove]  switchboard rules [list | add … 
 switchboard ask "…" -o A -o B [...]           switchboard ledger [tail | verify | export]
 switchboard review <file|url>                 (exit 0 approved, 1 changes requested)
 switchboard notify "…" [--urgency low]        switchboard demo [--speed 2]
+switchboard notify "…" --work <id> [--final]  switchboard work <id> <running|done>
 switchboard mcp                               switchboard hook <claude-code|codex>
 switchboard proxy [--gate …] -- <cmd…>         switchboard tunnel
 ```

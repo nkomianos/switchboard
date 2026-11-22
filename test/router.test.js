@@ -290,3 +290,251 @@ describe('agent-facing behaviour', () => {
     assert.equal(r.ledger.verify().ok, true);
   });
 });
+
+describe('work in passes: only the final outcome interrupts', () => {
+  const RESEARCHER = { id: 'researcher', name: 'Researcher' };
+  const WATCHDOG = { id: 'watchdog', name: 'Watchdog' };
+  const update = (over = {}) => ({ agent: RESEARCHER, question: 'Report ready', ...over });
+  const delivered = (pings) => pings.flatMap((n) => [...n.asks, ...n.digest].map((a) => a.id));
+
+  test('interim passes wait in the inbox; the final message is the one that pings', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-1', { status: 'running' });
+    const first = r.submit(update({ question: 'Market report, first pass', work: { id: 'req-1', pass: 'draft' }, attachments: [{ content: '# Draft', title: 'report.md' }] }));
+    assert.equal(first.delivery.mode, 'held');
+    assert.equal(first.delivery.work, 'interim');
+    assert.match(first.delivery.reason, /work “req-1” has another pass running or queued/);
+    // An automatic fix, run by a different agent, continues the same work.
+    const fix = r.submit({ agent: { id: 'fixer', name: 'Citation fixer' }, question: 'Fixed 3 citations', work: { id: 'req-1', pass: 'citations', continues: true } });
+    assert.equal(fix.delivery.mode, 'held');
+    advance(1100, r);
+    assert.equal(pings.length, 0, 'nothing pings while a pass is running');
+
+    const final = r.submit(update({ question: 'Market report, corrected', work: { id: 'req-1', final: true } }));
+    assert.equal(final.delivery.mode, 'queued');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [final.id]);
+    for (const a of [first, fix]) {
+      assert.equal(a.status, 'unread', 'interim passes stay in your inbox');
+      assert.equal(a.delivery.mode, 'held');
+      assert.match(a.delivery.reason, /a later message from work “req-1” is its outcome/);
+    }
+    // A natural break, the digest or time passing never brings an interim pass back.
+    r.setState('focus');
+    r.setState('available');
+    r.deliverDigest();
+    advance(36e5, r);
+    assert.deepEqual(delivered(pings), [final.id]);
+    assert.equal(r.stats.interim, 2);
+  });
+
+  test('closing the work releases the last pass when no final message was sent', () => {
+    const { r, pings } = makeRouter();
+    const msg = r.submit(update({ work: { id: 'req-2', continues: true } }));
+    advance(1100, r);
+    assert.equal(msg.delivery.mode, 'held');
+    const view = r.setWork('req-2', { status: 'done' });
+    assert.equal(view.open, false);
+    assert.equal(msg.delivery.mode, 'queued');
+    assert.match(msg.delivery.notes.join(' '), /work “req-2” is done; this is its outcome/);
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [msg.id]);
+  });
+
+  test('any agent, thread or channel works with no setup', () => {
+    const { r, pings } = makeRouter();
+    const thread = `brand-new-channel-${Date.now()}`;
+    const agent = 'An agent nobody configured';
+    const step = r.submit({ agent, thread, question: 'Step 1 of 2 done', work: { id: 'job-x', continues: true } });
+    const done = r.submit({ agent, thread, question: 'Both steps done', work: { id: 'job-x', final: true } });
+    advance(1100, r);
+    assert.equal(step.delivery.mode, 'held');
+    assert.deepEqual(delivered(pings), [done.id]);
+  });
+
+  test('decided at delivery time: a pass that starts inside the bundle window holds the report back', () => {
+    const { r, pings } = makeRouter();
+    const report = r.submit(update({ work: 'req-3' })); // nothing says more is coming, so it may ping
+    assert.equal(report.delivery.mode, 'queued');
+    assert.equal(r.budgets.get('researcher').tokens, 5);
+    advance(500, r);
+    r.setWork('req-3', { status: 'running' }); // seconds later, a follow-up pass starts
+    advance(600, r);
+    assert.equal(pings.length, 0, 'the earlier "send" verdict was not reused');
+    assert.equal(report.delivery.mode, 'held');
+    assert.equal(Math.round(r.budgets.get('researcher').tokens), 6, 'the ping it never made is refunded');
+    const corrected = r.submit(update({ question: 'Corrected report', work: { id: 'req-3', final: true } }));
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [corrected.id]);
+  });
+
+  test('decided at delivery time: a saved verdict is checked again when the bundle or digest goes out', () => {
+    const { r } = makeRouter();
+    const queued = r.submit(update({ work: 'req-4' }));
+    const digest = r.submit(update({ question: 'Low priority notes', urgency: 'low', work: 'req-5' }));
+    assert.equal(queued.delivery.mode, 'queued');
+    assert.equal(digest.delivery.mode, 'digest');
+    // The next passes start while those verdicts sit in saved state (e.g. across a restart).
+    const saved = JSON.parse(JSON.stringify(r.toJSON()));
+    for (const w of saved.work) w.open = true;
+    const { r: r2, pings } = makeRouter({ digest: { times: ['10:30'], onBreak: true } });
+    r2.load(saved);
+    advance(1100, r2);
+    advance(31 * 60e3, r2);
+    assert.equal(pings.length, 0);
+    for (const id of [queued.id, digest.id]) {
+      const a = r2.get(id);
+      assert.equal(a.delivery.mode, 'held');
+      assert.match(a.delivery.notes.join(' '), /checked again just before it went out/);
+    }
+  });
+
+  test('a stand-in note for work whose own message was held is held too, matched by work id, not title', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-7', { status: 'running' });
+    const own = r.submit(update({ question: 'Weekly summary', work: 'req-7' }));
+    const fallback = r.submit({ agent: WATCHDOG, question: 'No report arrived for your request', work: { id: 'req-7', fallback: true } });
+    assert.equal(own.delivery.mode, 'held');
+    assert.equal(fallback.delivery.mode, 'held');
+    r.setWork('req-7', { status: 'done' });
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [own.id]);
+    assert.equal(fallback.delivery.work, 'fallback');
+    assert.match(fallback.delivery.reason, /a stand-in note, but work “req-7” sent its own message/);
+    const late = r.submit({ agent: WATCHDOG, question: 'Still no report?', work: { id: 'req-7', fallback: true } });
+    assert.equal(late.delivery.work, 'fallback', 'after the real message went out, a stand-in is still held');
+
+    // Another work with the very same title: it never sent anything, so its stand-in does ping.
+    const other = r.submit({ agent: WATCHDOG, question: 'Weekly summary', work: { id: 'req-8', fallback: true } });
+    assert.equal(other.delivery.mode, 'queued');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [own.id, other.id]);
+
+    // What was held is recorded by the work's id.
+    const view = r.workView('req-7');
+    assert.deepEqual(view.held, [fallback.id, late.id]);
+    assert.deepEqual(view.delivered, [own.id]);
+    const routed = r.ledger.entries.filter((e) => e.type === 'ask.routed' && e.data.id === fallback.id);
+    assert.equal(routed[0].data.work, 'req-7');
+    assert.ok(r.ledger.entries.some((e) => e.type === 'work.closed' && e.data.work === 'req-7' && e.data.status === 'done'));
+  });
+
+  test('a stand-in that is waiting to go out is pulled back when the real message arrives', () => {
+    const { r, pings } = makeRouter();
+    const fallback = r.submit({ agent: WATCHDOG, question: 'No report came back', work: { id: 'req-9', fallback: true } });
+    assert.equal(fallback.delivery.mode, 'queued');
+    const real = r.submit(update({ work: 'req-9' }));
+    assert.equal(fallback.delivery.mode, 'held');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [real.id]);
+  });
+
+  test('a message that is only a file is judged like any other message', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-10', { status: 'running' });
+    const file = r.submit({ agent: RESEARCHER, work: 'req-10', attachments: ['/tmp/out/report.pdf'] });
+    assert.equal(file.question, 'Sent “report.pdf”');
+    assert.equal(file.delivery.mode, 'held');
+    assert.equal(file.delivery.work, 'interim');
+    advance(1100, r);
+    assert.equal(pings.length, 0, 'the file did not slip out while the work was open');
+    const final = r.submit(update({ work: { id: 'req-10', final: true } }));
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [final.id]);
+    // With no work id, a file on its own routes like any update.
+    const lone = r.submit({ agent: RESEARCHER, attachments: ['https://example.com/chart.png'] });
+    assert.equal(lone.delivery.mode, 'queued');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [final.id, lone.id]);
+  });
+
+  test('negative control: questions and critical messages still interrupt while the work is open', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-11', { status: 'running' });
+    const interim = r.submit(update({ work: 'req-11' }));
+    const question = r.submit(decision({ agent: RESEARCHER, question: 'Cover last year too?', work: 'req-11' }));
+    assert.equal(question.delivery.mode, 'queued');
+    const critical = r.submit(update({ question: 'The source is deleting its archive now', urgency: 'critical', work: 'req-11' }));
+    assert.equal(critical.delivery.mode, 'interrupted', 'critical goes out at once');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings).sort(), [critical.id, question.id].sort(), 'the question went out with the critical message');
+    assert.equal(interim.delivery.mode, 'held');
+    assert.equal(r.workView('req-11').open, true, 'a blocker does not end the work');
+  });
+
+  test('negative control: messages without a work id route exactly as before', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-12', { status: 'running' });
+    r.submit(update({ work: 'req-12' }));
+    const plain = r.submit(update({ question: 'Archived 3 newsletters' }));
+    assert.equal(plain.work, null);
+    assert.equal(plain.delivery.mode, 'queued');
+    assert.equal(plain.delivery.reason, 'normal urgency while you\'re available');
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [plain.id]);
+    assert.ok(!('work' in r.ledger.entries.find((e) => e.type === 'ask.created' && e.data.id === plain.id).data));
+    // Turned off in config, work ids are ignored.
+    const off = makeRouter({ work: null });
+    off.r.setWork('req-13', { status: 'running' });
+    assert.equal(off.r.submit(update({ work: 'req-13' })).delivery.mode, 'queued');
+  });
+
+  test('negative control: the final message is delivered once', () => {
+    const { r, pings } = makeRouter();
+    r.setWork('req-14', { status: 'queued' });
+    r.submit(update({ work: 'req-14' }));
+    const final = r.submit(update({ question: 'Done', work: { id: 'req-14', final: true } }));
+    advance(1100, r);
+    r.setWork('req-14', { status: 'done' }); // a late "done" after the final message
+    r.setState('focus');
+    r.setState('available');
+    r.deliverDigest();
+    for (let i = 0; i < 5; i++) advance(1100, r);
+    assert.equal(delivered(pings).filter((id) => id === final.id).length, 1);
+    assert.equal(r.stats.interrupted_asks, 1);
+  });
+
+  test('work with no news for hours counts as finished; a heartbeat keeps it open', () => {
+    const { r, pings } = makeRouter();
+    const msg = r.submit(update({ work: { id: 'req-15', continues: true } }));
+    advance(5 * 36e5, r);
+    r.setWork('req-15', { status: 'running' }); // heartbeat from a long pass
+    advance(5 * 36e5, r);
+    assert.equal(msg.delivery.mode, 'held');
+    assert.equal(pings.length, 0);
+    advance(36e5, r); // six hours since the last news
+    assert.match(msg.delivery.notes.join(' '), /no news from work “req-15” for 6h/);
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [msg.id]);
+  });
+
+  test('your snooze still wins over an open work', () => {
+    const { r, pings } = makeRouter();
+    const msg = r.submit(update({ work: { id: 'req-16', continues: true } }));
+    r.snooze(msg.id, 10 * 60e3);
+    advance(11 * 60e3, r);
+    advance(1100, r);
+    assert.deepEqual(delivered(pings), [msg.id]);
+  });
+
+  test('work ids are scoped: another agent key\'s work with the same id is a different work', () => {
+    const { r } = makeRouter();
+    r.setWork('job', { status: 'running' });
+    assert.equal(r.submit(update({ work: 'job' })).delivery.mode, 'held');
+    assert.equal(r.submit(update({ question: 'Other report', work: 'job' }), { scope: 'key:cloud' }).delivery.mode, 'queued');
+    assert.equal(r.workView('job', 'key:cloud').open, false);
+  });
+
+  test('open work and what it holds survive a restart', () => {
+    const { r } = makeRouter();
+    r.setWork('req-17', { status: 'running' });
+    const interim = r.submit(update({ work: 'req-17' }));
+    const { r: r2, pings } = makeRouter();
+    r2.load(JSON.parse(JSON.stringify(r.toJSON())));
+    advance(1100, r2);
+    const final = r2.submit(update({ work: { id: 'req-17', final: true } }));
+    advance(1100, r2);
+    assert.deepEqual(delivered(pings), [final.id]);
+    assert.equal(r2.get(interim.id).delivery.mode, 'held');
+  });
+});

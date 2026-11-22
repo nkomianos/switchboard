@@ -250,6 +250,23 @@ describe('agent keys (live daemon)', () => {
     await owner.request('PATCH', '/v1/config', { remote: { enabled: false, url: null } });
   });
 
+  test('an agent key reports its own work, and can\'t hold anyone else\'s', async () => {
+    const k = await owner.request('POST', '/v1/keys', { name: 'Cloud researcher' });
+    const agent = new SwitchboardClient({ url: d.url, token: k.key });
+    assert.equal((await agent.work('job-1', 'running')).open, true);
+    const interim = await agent.notify('Draft done', { work: 'job-1' });
+    assert.equal(interim.delivery.mode, 'held');
+    assert.deepEqual((await agent.request('GET', '/v1/work/job-1')).held, [interim.id]);
+    // The owner's work with the same id is a different work.
+    const local = await owner.notify('Local job finished', { agent: 'local-script', work: 'job-1' });
+    assert.notEqual(local.delivery.mode, 'held');
+    assert.deepEqual((await owner.request('GET', '/v1/work/job-1')).held, []);
+    await assert.rejects(agent.request('POST', '/v1/work/job-1', { status: 'paused' }), (e) => e.status === 400);
+    await assert.rejects(agent.request('GET', '/v1/work/nope'), (e) => e.status === 404);
+    const final = await agent.notify('Final report', { work: { id: 'job-1', final: true } });
+    assert.notEqual(final.delivery.mode, 'held');
+  });
+
   test('notification buttons need a valid signature', async () => {
     const a = await owner.submit({ agent: 'deployer', question: 'Ship it?', options: ['Ship', 'Wait'] });
     await assert.rejects(owner.request('POST', '/v1/actions/answer', { ask: a.id, option: 'ship', sig: 'f'.repeat(24) }), (e) => e.status === 403);

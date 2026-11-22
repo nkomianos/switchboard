@@ -103,6 +103,35 @@ function normalizeAttachments(raw, errors) {
   });
 }
 
+/** A message that is only attachments is still a message: name it after what's attached. */
+function attachmentHeadline(list) {
+  const names = list.map((a) => a.title);
+  return truncate(list.length === 1 ? `Sent “${names[0]}”` : `Sent ${list.length} attachments: ${names.join(', ')}`, 300);
+}
+
+/**
+ * The piece of work a message belongs to, so that only its final outcome interrupts you.
+ * A string is shorthand for {id}. Only `true` flags count: tools often send `false` for "not set".
+ */
+function normalizeWork(raw, errors) {
+  if (raw == null) return null;
+  const w = typeof raw === 'string' || typeof raw === 'number' ? { id: raw } : raw;
+  if (typeof w !== 'object' || Array.isArray(w)) {
+    errors.push('work must be an id or {id, pass?, continues?, final?, fallback?}');
+    return null;
+  }
+  const id = str(w.id);
+  if (!id) {
+    errors.push('work.id is required');
+    return null;
+  }
+  if (id.length > 200) errors.push('work.id must be ≤ 200 chars');
+  const continues = w.continues === true;
+  const final = w.final === true;
+  if (continues && final) errors.push('work: a message can’t both continue the work and be its final message');
+  return { id, pass: w.pass == null ? null : truncate(String(w.pass), 60), continues, final, fallback: w.fallback === true };
+}
+
 function normalizeDetail(raw) {
   if (raw == null) return { line: null, paragraph: null, full: null };
   if (typeof raw === 'string') return { line: null, paragraph: raw, full: null };
@@ -128,7 +157,10 @@ export function normalizeAsk(input, now = Date.now()) {
   if (kind === 'decision' && options.length < 2) errors.push('a decision needs at least 2 options');
   if (kind === 'input' && !inputSpec) errors.push('an input ask needs an `input` field');
 
-  const question = str(input.question ?? input.title ?? input.message);
+  const attachments = normalizeAttachments(input.attachments, errors);
+  let question = str(input.question ?? input.title ?? input.message);
+  // A file with no text is judged like any other update, never skipped or let through unrouted.
+  if (!question && kind === 'inform' && attachments.length) question = attachmentHeadline(attachments);
   if (!question) errors.push('question is required');
   else if (question.length > 300) errors.push('question must be ≤ 300 chars; put the rest in detail');
 
@@ -154,8 +186,9 @@ export function normalizeAsk(input, now = Date.now()) {
     delay_cost: str(input.delay_cost),
     detail: normalizeDetail(input.detail),
     review,
-    attachments: normalizeAttachments(input.attachments, errors),
+    attachments,
     thread: str(input.thread),
+    work: normalizeWork(input.work, errors),
     collapse_key: str(input.collapse_key),
     tags: Array.isArray(input.tags) ? input.tags.map(String).slice(0, 10) : [],
     fingerprint: null,

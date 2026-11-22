@@ -60,14 +60,24 @@ function whoIs(req, url, token, keys) {
   return key ? { role: 'agent', key } : null;
 }
 
-// What an agent key may do: ask, wait for and withdraw its own asks, read coarse state.
+// What an agent key may do: ask, wait for and withdraw its own asks, report its own work, read coarse state.
 const AGENT_ROUTES = [
   ['GET', /^\/v1\/state$/],
   ['POST', /^\/v1\/asks$/],
   ['GET', /^\/v1\/asks\/[\w-]+$/],
   ['GET', /^\/v1\/asks\/[\w-]+\/wait$/],
   ['DELETE', /^\/v1\/asks\/[\w-]+$/],
+  ['GET', /^\/v1\/work\/[^/]+$/],
+  ['POST', /^\/v1\/work\/[^/]+$/],
 ];
+
+// Work ids belong to whoever sends them: the owner token shares one namespace (so another
+// local agent can run the next pass); each agent key has its own.
+const workScope = (who) => (who.role === 'agent' ? `key:${who.key.agent_id}` : null);
+
+function decodeParam(s) {
+  try { return decodeURIComponent(s); } catch { throw httpError(400, 'bad id in the URL'); }
+}
 
 export function createServer({ router, token, version, getConfig, updateConfig, notifyTest, onShutdown, startDemo, keys = null, extraRoutes = [], remote = () => false, mcpHttp = null }) {
   const clients = new Set();
@@ -111,7 +121,7 @@ export function createServer({ router, token, version, getConfig, updateConfig, 
         const name = (typeof b.agent === 'object' && b.agent?.name) || k.name;
         b.agent = { id: k.agent_id, name, instance: typeof b.agent === 'object' ? b.agent?.instance : undefined };
       }
-      const ask = router.submit(b);
+      const ask = router.submit(b, { scope: workScope(q.who) });
       if (q.who.role === 'agent') ask.key_id = q.who.key.id;
       const waitMs = Math.min(parseDuration(q.url.searchParams.get('wait')) ?? 0, MAX_WAIT_MS);
       if (waitMs > 0) await router.wait(ask.id, waitMs);
@@ -145,6 +155,15 @@ export function createServer({ router, token, version, getConfig, updateConfig, 
     }],
     ['POST', /^\/v1\/asks\/([\w-]+)\/unsnooze$/, async (q, id) => answerView(router.unsnooze(id, { surface: (await q.body()).surface || 'api' }))],
     ['DELETE', /^\/v1\/asks\/([\w-]+)$/, (q, id) => { ownAsk(q, id); return answerView(router.cancel(id, q.url.searchParams.get('reason'))); }],
+    ['GET', /^\/v1\/work\/([^/]+)$/, (q, id) => {
+      const w = router.workView(decodeParam(id), workScope(q.who));
+      if (!w) throw httpError(404, `no work ${decodeParam(id)}`);
+      return w;
+    }],
+    ['POST', /^\/v1\/work\/([^/]+)$/, async (q, id) => {
+      const b = await q.body();
+      return router.setWork(decodeParam(id), { status: b.status, pass: b.pass, scope: workScope(q.who) });
+    }],
     ['GET', /^\/v1\/keys$/, () => ({ keys: keys?.list() ?? [] })],
     ['POST', /^\/v1\/keys$/, async (q) => [201, keys.create(await q.body())]],
     ['DELETE', /^\/v1\/keys\/([\w-]+)$/, (q, id) => keys.revoke(id)],

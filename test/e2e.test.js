@@ -240,6 +240,53 @@ describe('phone push (ntfy)', () => {
   });
 });
 
+describe('work in passes', () => {
+  test('over HTTP, only the final message of a work pings; questions still do', async () => {
+    const pinged = [];
+    const onPing = (n) => pinged.push(...n.asks.map((a) => a.id), ...n.digest.map((a) => a.id));
+    d.router.on('interrupt', onPing);
+    try {
+      const agent = { id: 'research-e2e', name: 'Researcher' };
+      await c.work('req-e2e', 'running');
+      const draft = await c.notify('Draft report', { agent, work: { id: 'req-e2e', pass: 'draft' }, attachments: [{ content: '# Draft', title: 'draft.md' }] });
+      const file = await c.submit({ agent, work: 'req-e2e', attachments: [{ content: 'a,b', title: 'data.csv', format: 'text' }] });
+      const fallback = await c.notify('No report arrived', { agent: { id: 'watchdog-e2e', name: 'Watchdog' }, work: { id: 'req-e2e', fallback: true } });
+      for (const x of [draft, file, fallback]) assert.equal(x.delivery.mode, 'held');
+      assert.equal(file.ask.question, 'Sent “data.csv”');
+      const blocker = await c.submit({ agent, question: 'Include last year?', options: ['Yes', 'No'], work: 'req-e2e' });
+      assert.equal(blocker.delivery.mode, 'queued', 'a question still reaches you while the work runs');
+      const final = await c.notify('Corrected report', { agent, work: { id: 'req-e2e', final: true } });
+      assert.equal(final.delivery.mode, 'queued');
+      for (let i = 0; i < 60 && !pinged.includes(final.id); i++) await sleep(50);
+      const w = await c.request('GET', '/v1/work/req-e2e');
+      assert.equal(w.open, false);
+      assert.deepEqual(w.held.sort(), [draft.id, file.id, fallback.id].sort());
+      assert.deepEqual(w.delivered.sort(), [blocker.id, final.id].sort());
+      for (const id of [draft.id, file.id, fallback.id]) assert.ok(!pinged.includes(id), 'interim messages never pinged');
+      await sleep(300);
+      assert.equal(pinged.filter((x) => x === final.id).length, 1, 'the final message pinged once');
+      await c.request('DELETE', `/v1/asks/${blocker.id}`);
+    } finally {
+      d.router.off('interrupt', onPing);
+    }
+  });
+
+  test('from the shell: report a pass, send an update, finish the work', async () => {
+    const run = (...args) => new Promise((resolve) => {
+      const child = spawn(process.execPath, [BIN, ...args], { env });
+      let out = '';
+      child.stdout.on('data', (b) => { out += b; });
+      child.on('exit', (code) => resolve({ code, out }));
+    });
+    assert.equal((await run('work', 'req-cli', 'running')).code, 0);
+    assert.match((await run('notify', 'Nightly import finished', '--work', 'req-cli')).out, /held/);
+    assert.match((await run('work', 'req-cli', 'done')).out, /finished \(done\), 0 held/);
+    const w = await c.request('GET', '/v1/work/req-cli');
+    const a = (await c.request('GET', `/v1/asks/${w.latest}`)).ask;
+    assert.ok(['queued', 'interrupted'].includes(a.delivery.mode), 'released when the work finished');
+  });
+});
+
 describe('persistence', () => {
   test('the ledger verifies after all of the above', async () => {
     const v = await c.request('GET', '/v1/ledger/verify');

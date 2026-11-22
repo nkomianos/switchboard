@@ -36,6 +36,24 @@ describe('spec', () => {
       assert.match(msg, /default "nope"/);
     }
   });
+
+  test('work: an id, or {id, pass, continues, final, fallback}', () => {
+    assert.equal(normalizeAsk({ question: 'x' }).work, null, 'no work field, nothing new');
+    assert.deepEqual(normalizeAsk({ question: 'x', work: 'req-1' }).work, { id: 'req-1', pass: null, continues: false, final: false, fallback: false });
+    assert.deepEqual(normalizeAsk({ question: 'x', work: { id: 7, pass: 2, final: true } }).work, { id: '7', pass: '2', continues: false, final: true, fallback: false });
+    const unset = normalizeAsk({ question: 'x', work: { id: 'a', continues: false, final: false } }).work;
+    assert.equal(unset.continues || unset.final, false, 'false flags mean "not set"');
+    assert.throws(() => normalizeAsk({ question: 'x', work: { pass: 1 } }), /work\.id is required/);
+    assert.throws(() => normalizeAsk({ question: 'x', work: { id: 'a', continues: true, final: true } }), /both continue/);
+  });
+
+  test('an update can be just an attachment; a question still needs its text', () => {
+    const a = normalizeAsk({ attachments: ['/tmp/out/report.pdf'] });
+    assert.equal(a.kind, 'inform');
+    assert.equal(a.question, 'Sent “report.pdf”');
+    assert.equal(normalizeAsk({ attachments: [{ url: 'https://x.test/a' }, { content: '# hi', title: 'notes' }] }).question, 'Sent 2 attachments: https://x.test/a, notes');
+    assert.throws(() => normalizeAsk({ options: ['A', 'B'], attachments: ['/tmp/a.md'] }), /question is required/);
+  });
 });
 
 describe('util', () => {
