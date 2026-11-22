@@ -1,7 +1,7 @@
 // Agent keys: give a script or another agent its own key instead of your owner
-// token. A key can ask, notify, wait for its own answers and read your coarse
-// state. It can't answer, read your inbox, change settings, or claim to be a
-// different agent: its asks are always attributed to the key's agent id.
+// token. A key can ask, notify, wait for its own answers, report its own work and
+// read your coarse state. It can't answer, read your inbox, change settings, or claim
+// to be a different agent: its asks are always attributed to the key's agent id.
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readJSON, writeJSON } from './config.js';
 import { newId, randomToken, slug } from './util.js';

@@ -9,7 +9,7 @@ import { Ledger } from './ledger.js';
 import { Rules } from './rules.js';
 import { findOption, isOpen, normalizeAsk } from './spec.js';
 import { HumanState, MODES } from './state.js';
-import { URGENCY, escapeGlob, fmtDuration, hhmmToMinutes, newId, urgencyRank } from './util.js';
+import { URGENCY, escapeGlob, fmtDuration, hhmmToMinutes, newId, truncate, urgencyRank } from './util.js';
 
 export const DEFAULT_ROUTER_CONFIG = {
   bundleWindowMs: 4000,
@@ -20,9 +20,18 @@ export const DEFAULT_ROUTER_CONFIG = {
   digest: { times: ['12:00', '17:30'], onBreak: true },
   quietHours: null,
   calendar: null,
+  // Work in passes: only the final outcome interrupts. An open work with no news for
+  // staleMs counts as finished, so a crashed agent can't hide its last message. null = off.
+  work: { staleMs: 6 * 36e5 },
 };
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+// A unit of work is open while a pass is running or queued, and finished otherwise.
+export const WORK_OPEN = ['running', 'queued'];
+export const WORK_CLOSED = ['done', 'failed', 'cancelled'];
+// Work ids are the agent's own. Agent keys get their own namespace (scope), so one agent can't hold another's messages.
+const workKey = (w) => JSON.stringify([w.scope ?? null, w.id]);
 
 function summarize(ask) {
   return {
@@ -37,6 +46,7 @@ function summarize(ask) {
     reversible: ask.reversible,
     fingerprint: ask.fingerprint,
     thread: ask.thread,
+    ...(ask.work ? { work: ask.work } : {}),
   };
 }
 
@@ -57,21 +67,25 @@ export class Router extends EventEmitter {
     this.fyiLog = new Map(); // agent id -> recent update outcomes (read / dismissed)
     this.suggestions = new Map();
     this.declined = new Set();
+    this.work = new Map(); // workKey -> { id, scope?, open, status, latest, fallback, ... }: keyed by the work's id, never its title
     // notifications = times you were actually pinged (a bundle and a digest delivered together count once).
-    this.stats = { asks: 0, notifications: 0, interruptions: 0, interrupted_asks: 0, bundled_asks: 0, held: 0, digested: 0, digests: 0, auto: 0, answered: 0, dismissed: 0, defaulted: 0, expired: 0 };
+    this.stats = { asks: 0, notifications: 0, interruptions: 0, interrupted_asks: 0, bundled_asks: 0, held: 0, interim: 0, digested: 0, digests: 0, auto: 0, answered: 0, dismissed: 0, defaulted: 0, expired: 0 };
     this.lastState = this.state.current();
     this.lastDigestCheck = clock();
   }
 
   // ---------------------------------------------------------------- intake
 
-  submit(input) {
+  /** scope: whose work ids these are (null for the owner token; the server sets one per agent key). */
+  submit(input, { scope = null } = {}) {
     const now = this.clock();
     const ask = normalizeAsk(input, now);
+    if (ask.work && scope) ask.work.scope = scope;
     this.budgets.noteAsk(ask.agent, ask.urgency);
     this.stats.asks++;
     this.asks.set(ask.id, ask);
     this.ledger.append('ask.created', summarize(ask));
+    const work = ask.work ? this._noteWork(ask, now) : null;
     this.emit('ask', ask);
 
     // Like a mobile push collapse_key: a newer message from the same agent replaces the open older one.
@@ -100,6 +114,8 @@ export class Router extends EventEmitter {
       if (rule) ask.rule = { id: rule.id, route: rule.action.route };
       this._applyRoute(ask, this._decide(ask, now), now);
     }
+    // The work's other messages may now be superseded, or released because it finished.
+    if (work) this._settleWork(work, now, { except: ask.id });
     this._prune(now);
     return ask;
   }
@@ -136,6 +152,8 @@ export class Router extends EventEmitter {
     const rec = this.budgets.get(ask.agent);
     const forced = ask.rule?.route;
     if (forced === 'now') return { mode: 'interrupt', bypass: true, reason: 'your rule says always interrupt for this', notes };
+    const interim = this._workHold(ask, now, rank);
+    if (interim) return { mode: 'held', reason: interim.reason, work: interim.kind, notes };
     if (forced === 'digest') return { mode: 'digest', reason: 'your rule sends this to the digest', notes };
     if (forced === 'hold' || forced === 'mute') return { mode: 'held', reason: 'your rule says never interrupt for this', notes };
     if (rec.muted) return { mode: 'held', reason: `you muted ${rec.name}`, notes };
@@ -167,19 +185,43 @@ export class Router extends EventEmitter {
       if (!this.bundle) this.bundle = { id: newId('bdl'), ids: [], opened: now };
       this.bundle.ids.push(ask.id);
     } else {
-      ask.delivery = { mode: d.mode, reason: d.reason, notes: d.notes, at: now };
+      ask.delivery = { mode: d.mode, reason: d.reason, notes: d.notes, at: now, ...(d.work ? { work: d.work } : {}) };
       if (d.mode === 'held' && !ask.was_held) { ask.was_held = true; this.stats.held++; }
+      if (d.work && !ask.was_interim) { ask.was_interim = true; this.stats.interim++; }
       if (d.mode === 'digest' && !ask.was_digested) { ask.was_digested = true; this.stats.digested++; }
     }
-    if (prev !== ask.delivery.mode) this.ledger.append('ask.routed', { id: ask.id, mode: ask.delivery.mode, reason: d.reason, notes: d.notes });
+    if (prev !== ask.delivery.mode) this.ledger.append('ask.routed', { id: ask.id, mode: ask.delivery.mode, reason: d.reason, notes: d.notes, ...(ask.work ? { work: ask.work.id } : {}) });
     this.emit('update', ask);
     if (d.mode === 'interrupt' && urgencyRank(ask.urgency) === 3) this._flush(now);
+  }
+
+  /** Take an ask out of the pending bundle. It never cost you attention, so the agent gets its ping back. */
+  _unqueue(ask) {
+    if (this.bundle) this.bundle.ids = this.bundle.ids.filter((x) => x !== ask.id);
+    if (ask.delivery?.mode !== 'queued') return false;
+    const rec = this.budgets.get(ask.agent);
+    rec.interrupts = Math.max(0, rec.interrupts - 1);
+    if (ask.delivery.spent) rec.tokens = Math.min(rec.capacity, rec.tokens + 1);
+    return true;
+  }
+
+  /**
+   * Decide at delivery time, not when first seen: a ping or digest verdict made earlier is
+   * stale if the ask's work has started another pass since. Returns true if it was held back.
+   */
+  _heldAtDelivery(ask, now) {
+    if (ask.delivery.spent === false) return false; // critical, your rule or your snooze: not about the work
+    const hold = this._workHold(ask, now);
+    if (!hold) return false;
+    this._unqueue(ask);
+    this._applyRoute(ask, { mode: 'held', reason: hold.reason, work: hold.kind, notes: ['checked again just before it went out'] }, now);
+    return true;
   }
 
   _flush(now, digestItems = []) {
     const bundle = this.bundle;
     this.bundle = null;
-    const items = (bundle?.ids ?? []).map((id) => this.asks.get(id)).filter((a) => a && isOpen(a) && a.delivery?.mode === 'queued');
+    const items = (bundle?.ids ?? []).map((id) => this.asks.get(id)).filter((a) => a && isOpen(a) && a.delivery?.mode === 'queued' && !this._heldAtDelivery(a, now));
     if (!items.length && !digestItems.length) return null;
     const id = bundle?.id ?? newId('bdl');
     for (const a of items) {
@@ -200,7 +242,7 @@ export class Router extends EventEmitter {
   }
 
   _collectDigest(now) {
-    const items = [...this.asks.values()].filter((a) => isOpen(a) && a.delivery?.mode === 'digest' && !a.delivery.digested_at);
+    const items = [...this.asks.values()].filter((a) => isOpen(a) && a.delivery?.mode === 'digest' && !a.delivery.digested_at && !this._heldAtDelivery(a, now));
     for (const a of items) a.delivery.digested_at = now;
     if (items.length) this.stats.digests++;
     return items;
@@ -240,6 +282,7 @@ export class Router extends EventEmitter {
       this.emit('state', st);
     }
 
+    this._tickWork(now);
     for (const ask of this.asks.values()) {
       if (!isOpen(ask)) continue;
       if (ask.deadline && ask.deadline <= now) {
@@ -280,6 +323,150 @@ export class Router extends EventEmitter {
       this._finalize(ask, 'expired', null);
     }
     this.budgets.onOutcome(ask.agent, 'ignored', { interrupted, urgency: ask.urgency });
+  }
+
+  // -------------------------------------------------------- work in passes
+  //
+  // One request is often worked on in several passes (a first pass, an automatic fix, a
+  // follow-up that closes gaps, a next stage). Only the final outcome should interrupt you.
+  // While a work has a pass running or queued, its updates are interim: in the inbox, no
+  // ping. When it finishes, its newest message is the one that may interrupt.
+
+  _workRec(id, scope, now) {
+    const key = workKey({ id, scope });
+    let rec = this.work.get(key);
+    if (!rec) {
+      rec = { id, ...(scope ? { scope } : {}), open: false, status: null, pass: null, latest: null, fallback: null, created_at: now, updated_at: now, opened_at: null, closed_at: null };
+      this.work.set(key, rec);
+    }
+    return rec;
+  }
+
+  _markWork(rec, open, status, now, by) {
+    const was = rec.open;
+    rec.open = open;
+    rec.status = status;
+    rec.updated_at = now;
+    if (open && !was) rec.opened_at = now;
+    if (!open) rec.closed_at = now;
+    if (open !== was) this.ledger.append(open ? 'work.opened' : 'work.closed', { work: rec.id, ...(rec.scope ? { scope: rec.scope } : {}), status, by });
+  }
+
+  /** A message arrived for a work: record it by the work's id and apply its continues / final flag. */
+  _noteWork(ask, now) {
+    const w = ask.work;
+    const rec = this._workRec(w.id, w.scope ?? null, now);
+    if (w.pass != null) rec.pass = w.pass;
+    rec.updated_at = now;
+    if (w.fallback) {
+      rec.fallback = ask.id; // a stand-in never changes whether the work is open
+      return rec;
+    }
+    // Updates compete to be the outcome. A question only does if it says it's the final message;
+    // otherwise it's a blocker, which routes on its own and must not hide the work's report.
+    if (ask.kind === 'inform' || w.final) rec.latest = ask.id;
+    if (w.continues) this._markWork(rec, true, 'continues', now, ask.id);
+    else if (w.final) this._markWork(rec, false, 'final', now, ask.id);
+    return rec;
+  }
+
+  /**
+   * Why an update from a unit of work must not interrupt you right now, or null. Questions
+   * (only you can unblock them), critical messages, your "always interrupt" rules and your
+   * snoozes are never held back by this.
+   */
+  _workHold(ask, now, rank = urgencyRank(ask.urgency)) {
+    const w = ask.work;
+    if (!w || !this.config.work || ask.kind !== 'inform' || rank >= 3 || ask.woke || ask.rule?.route === 'now') return null;
+    const rec = this.work.get(workKey(w));
+    if (!rec) return null;
+    const name = `work “${w.id}”`;
+    if (rec.open) return { kind: 'interim', reason: `${name} has another pass running or queued; only its final message pings you` };
+    if (w.fallback) {
+      const own = rec.latest ? this.asks.get(rec.latest) : null;
+      if (rec.latest && own?.status !== 'cancelled') return { kind: 'fallback', reason: `a stand-in note, but ${name} sent its own message` };
+      if (rec.fallback !== ask.id) return { kind: 'superseded', reason: `a newer stand-in note for ${name} replaced it` };
+      return null;
+    }
+    if (rec.latest !== ask.id) return { kind: 'superseded', reason: `a later message from ${name} is its outcome` };
+    return null;
+  }
+
+  /** Re-judge the open updates of a work after it changed: hold the ones that are now interim, release the outcome. */
+  _settleWork(rec, now, { except = null, note = null } = {}) {
+    const key = workKey(rec);
+    for (const a of [...this.asks.values()]) {
+      if (a.id === except || a.kind !== 'inform' || !isOpen(a) || !a.work || workKey(a.work) !== key) continue;
+      const mode = a.delivery?.mode;
+      if (!['queued', 'held', 'digest'].includes(mode) || a.delivery.digested_at) continue; // already delivered, snoozed or settled
+      const hold = mode === 'queued' && a.delivery.spent === false ? null : this._workHold(a, now);
+      if (hold) {
+        if (a.delivery.work && a.delivery.reason === hold.reason) continue;
+        this._unqueue(a);
+        this._applyRoute(a, { mode: 'held', reason: hold.reason, work: hold.kind, notes: [] }, now);
+      } else if (a.delivery.work) {
+        const d = this._decide(a, now);
+        if (note) d.notes.push(note);
+        this._applyRoute(a, d, now);
+      }
+    }
+  }
+
+  /** Open work with no news for a long time counts as finished, so a crashed agent can't hide its last message. */
+  _tickWork(now) {
+    const staleMs = this.config.work?.staleMs;
+    if (!staleMs) return;
+    for (const rec of this.work.values()) {
+      if (!rec.open || now - rec.updated_at < staleMs) continue;
+      this._markWork(rec, false, 'stale', now, 'router');
+      this._settleWork(rec, now, { note: `no news from work “${rec.id}” for ${fmtDuration(staleMs)}, so this counts as its outcome` });
+      this.emit('work', rec);
+    }
+  }
+
+  _pruneWork(now) {
+    if (this.work.size < 200) return;
+    const live = new Set([...this.asks.values()].filter((a) => a.work && isOpen(a)).map((a) => workKey(a.work)));
+    for (const [key, rec] of this.work) if (!rec.open && now - rec.updated_at > 7 * 864e5 && !live.has(key)) this.work.delete(key);
+  }
+
+  /**
+   * An agent reports a work's state without sending a message: a pass is `running` or
+   * `queued` (send it again as a heartbeat), or the work is `done`, `failed` or `cancelled`.
+   */
+  setWork(id, { status, pass = null, scope = null } = {}) {
+    const wid = String(id ?? '').trim();
+    if (!wid || wid.length > 200) throw httpError(400, 'a work id is 1 to 200 characters');
+    if (![...WORK_OPEN, ...WORK_CLOSED].includes(status)) throw httpError(400, `status must be one of ${[...WORK_OPEN, ...WORK_CLOSED].join(', ')}`);
+    const now = this.clock();
+    const rec = this._workRec(wid, scope, now);
+    if (pass != null) rec.pass = truncate(String(pass), 60);
+    this._markWork(rec, WORK_OPEN.includes(status), status, now, 'status');
+    this._settleWork(rec, now, { note: rec.open ? null : `work “${wid}” is ${status}; this is its outcome` });
+    this.emit('work', rec);
+    return this.workView(wid, scope);
+  }
+
+  /** A work's state and its messages: what is held and what reached you, by the work's id. */
+  workView(id, scope = null) {
+    const rec = this.work.get(workKey({ id: String(id ?? '').trim(), scope }));
+    if (!rec) return null;
+    const key = workKey(rec);
+    const mine = [...this.asks.values()].filter((a) => a.work && workKey(a.work) === key).sort((a, b) => a.created_at - b.created_at);
+    return {
+      id: rec.id,
+      open: rec.open,
+      status: rec.status,
+      pass: rec.pass,
+      latest: rec.latest,
+      fallback: rec.fallback,
+      messages: mine.map((a) => a.id),
+      held: mine.filter((a) => isOpen(a) && a.delivery?.work).map((a) => a.id),
+      delivered: mine.filter((a) => a.delivery?.mode === 'interrupted' || a.delivery?.digested_at).map((a) => a.id),
+      opened_at: rec.opened_at,
+      closed_at: rec.closed_at,
+      updated_at: rec.updated_at,
+    };
   }
 
   // ------------------------------------------------------------- responses
@@ -375,14 +562,8 @@ export class Router extends EventEmitter {
     ask.status = status;
     ask.answer = answer ? { ...answer, at: now } : null;
     ask.resolved_at = now;
-    if (this.bundle) this.bundle.ids = this.bundle.ids.filter((x) => x !== ask.id);
     // Settled before the ping went out: it never cost you attention, so refund it.
-    if (ask.delivery?.mode === 'queued') {
-      const rec = this.budgets.get(ask.agent);
-      rec.interrupts = Math.max(0, rec.interrupts - 1);
-      if (ask.delivery.spent) rec.tokens = Math.min(rec.capacity, rec.tokens + 1);
-      ask.delivery = { ...ask.delivery, mode: 'settled-before-ping' };
-    }
+    if (this._unqueue(ask)) ask.delivery = { ...ask.delivery, mode: 'settled-before-ping' };
     this.ledger.append('ask.resolved', {
       id: ask.id,
       agent: ask.agent.id,
@@ -631,6 +812,7 @@ export class Router extends EventEmitter {
   }
 
   _prune(now) {
+    this._pruneWork(now);
     if (this.asks.size < 2000) return;
     const cutoff = now - 7 * 864e5;
     for (const [id, a] of this.asks) if (!isOpen(a) && (a.resolved_at ?? 0) < cutoff) this.asks.delete(id);
@@ -648,6 +830,7 @@ export class Router extends EventEmitter {
       fyiLog: [...this.fyiLog],
       suggestions: [...this.suggestions.values()],
       declined: [...this.declined],
+      work: [...this.work.values()],
       stats: this.stats,
       lastDigestCheck: this.lastDigestCheck,
     };
@@ -662,6 +845,7 @@ export class Router extends EventEmitter {
     this.fyiLog = new Map(data.fyiLog || []);
     this.suggestions = new Map((data.suggestions || []).map((s) => [s.id, s]));
     this.declined = new Set(data.declined || []);
+    this.work = new Map((data.work || []).map((w) => [workKey(w), w]));
     Object.assign(this.stats, data.stats || {});
     if (data.lastDigestCheck) this.lastDigestCheck = data.lastDigestCheck;
     this.lastState = this.state.current();

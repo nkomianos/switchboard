@@ -13,6 +13,8 @@ All notable changes to Switchboard. The format follows [Keep a Changelog](https:
 - The Connect page says when Claude Code or Codex replies need their CLI, with the install command.
 - CI on Windows, macOS and Linux (Node 20, 22 and 24).
 - SECURITY.md, CONTRIBUTING.md, issue templates, and a comparison with other approaches in the README.
+- **Final outcome only.** A message can say which piece of work it belongs to (`work: {id, pass, continues, final, fallback}`). While the work has a pass running or queued, its updates wait in the inbox without pinging; when it finishes, only its newest message pings you. The check runs again at the moment of delivery, a stand-in "no report arrived" note is held when the work's own message exists, and work with no news for 6 hours counts as finished. Report a pass without a message with `POST /v1/work/:id`, `switchboard work`, or `client.work()`; `notify_human` takes the same fields. Messages without `work` route as before.
+- An update can be only an attachment: with no `question`, its headline is made from the file names, and it's routed like any other message.
 
 ### Changed
 - Claude Code permission prompts wait **60 seconds** for you by default (was 10 minutes), then Claude shows its own prompt. Change it in Settings → Delivery. The hook timeout written to Claude's settings is now only a ceiling, so changing the wait never needs a reconnect.

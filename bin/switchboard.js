@@ -35,7 +35,10 @@ Agents
   switchboard ask "Question?" -o Yes -o No [--urgency high] [--deadline 10m] [--default No]
                                            Blocks, prints the answer (scriptable)
   switchboard review <file|url> [--title "…"]  Ask for a review; exit 0 approved, 1 changes requested
-  switchboard notify "Message" [--urgency low]
+  switchboard notify "Message" [--urgency low] [--file path] [--work id [--continues | --final | --fallback]]
+                                           Only the final message of a work pings you
+  switchboard work <id> [running|queued|done|failed|cancelled]
+                                           Report a pass of a work (or show the work)
   switchboard mcp                              MCP server: ask_human, request_review, notify_human, …
   switchboard proxy [--name x] [--gate "delete_*"] -- <mcp server command...>
                                            Route a server's elicitations + gate its tools
@@ -470,8 +473,29 @@ async function main() {
     case 'ask': return cmdAsk(args);
     case 'review': return cmdReview(args);
     case 'notify': {
-      const r = await new SwitchboardClient().notify(args._.join(' '), { agent: args.flags.agent ? String(args.flags.agent) : { id: 'cli', name: 'Terminal' }, urgency: args.flags.urgency || 'normal' });
+      // A bare flag can swallow the next word ("--final Report ready"): give the word back to the message.
+      const flag = (name) => {
+        const v = args.flags[name];
+        if (v == null || v === 'false') return false;
+        for (const x of list(v)) if (x !== true && x !== 'true') args._.push(String(x));
+        return true;
+      };
+      const work = args.flags.work ? { id: String(args.flags.work), continues: flag('continues'), final: flag('final'), fallback: flag('fallback') } : undefined;
+      const attachments = list(args.flags.file).filter((f) => f !== true).map((f) => ({ path: resolve(String(f)) }));
+      const r = await new SwitchboardClient().notify(args._.join(' '), {
+        agent: args.flags.agent ? String(args.flags.agent) : { id: 'cli', name: 'Terminal' },
+        urgency: args.flags.urgency || 'normal',
+        ...(work ? { work } : {}),
+        ...(attachments.length ? { attachments } : {}),
+      });
       return console.log(`${r.id}: ${r.delivery?.mode} (${r.delivery?.reason})`);
+    }
+    case 'work': {
+      const [id, status] = args._;
+      if (!id) die('usage: switchboard work <id> [running|queued|done|failed|cancelled]');
+      const c = new SwitchboardClient();
+      const w = status ? await c.work(id, status, { pass: args.flags.pass }) : (await c.ensure(), await c.request('GET', `/v1/work/${encodeURIComponent(id)}`));
+      return console.log(`${w.id}: ${w.open ? 'open' : 'finished'}${w.status ? ` (${w.status})` : ''}, ${w.held.length} held, ${w.delivered.length} delivered`);
     }
     case 'rules': return cmdRules(args);
     case 'ledger': return cmdLedger(args);

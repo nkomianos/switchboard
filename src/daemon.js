@@ -84,7 +84,7 @@ export async function startDaemon({ home, port, overrides = {}, log = (m) => con
     }
   };
   const save = () => { if (!saveTimer) saveTimer = setTimeout(saveNow, 300); };
-  for (const ev of ['ask', 'update', 'state', 'rules', 'agents']) router.on(ev, save);
+  for (const ev of ['ask', 'update', 'state', 'rules', 'agents', 'work']) router.on(ev, save);
 
   // Phone push.
   let ntfy = null;

@@ -129,16 +129,22 @@ export function buildMcpServer({ client, defaultWaitSeconds = 120, maxWaitSecond
 
   server.registerTool('notify_human', {
     title: 'Tell the human something',
-    description: 'Send an FYI that needs no answer (task finished, something noteworthy). Switchboard batches these into digests unless urgent, so use it freely instead of interrupting.',
+    description: 'Send an FYI that needs no answer (task finished, something noteworthy). Switchboard batches these into digests unless urgent, so use it freely instead of interrupting. ' +
+      'If the message belongs to a piece of work done in several passes, pass its id as `work`: only the final message of the work pings the human.',
     inputSchema: {
       message: z.string().describe('One line.'),
       urgency: z.enum(['low', 'normal', 'high', 'critical']).optional(),
       summary: z.string().optional(),
       thread: z.string().optional(),
+      work: z.string().optional().describe('Stable id of the request or job this message belongs to. Use the same id for every pass of it.'),
+      continues: z.boolean().optional().describe('true if another pass of this work will follow, so this message is not its final outcome.'),
+      final: z.boolean().optional().describe('true if this message is the final outcome of the work.'),
+      fallback: z.boolean().optional().describe('true for a stand-in note written because the work\'s own message did not arrive. It is held if that message did arrive.'),
     },
   }, async (args) => {
     try {
-      const r = await c.notify(args.message, { agent: agent(), urgency: args.urgency ?? 'low', detail: args.summary, thread: args.thread });
+      const work = args.work ? { id: args.work, continues: args.continues, final: args.final, fallback: args.fallback } : undefined;
+      const r = await c.notify(args.message, { agent: agent(), urgency: args.urgency ?? 'low', detail: args.summary, thread: args.thread, work });
       return text({ id: r.id, delivery: r.delivery });
     } catch (err) {
       return { ...text(`Switchboard error: ${err.message}`), isError: true };
